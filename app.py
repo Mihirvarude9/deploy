@@ -8,7 +8,7 @@ import os
 
 # ✅ Config
 model_id = "stabilityai/stable-diffusion-3.5-medium"
-API_KEY = "wildmind_1234567890"  # replace with your actual key
+API_KEY = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"  # replace with your actual key
 OUTPUT_DIR = "generated"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
