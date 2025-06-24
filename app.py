@@ -54,7 +54,7 @@ class PromptRequest(BaseModel):
     prompt: str
 
 # === /medium endpoint ===
-@app.post("/medium")
+@app.post("/generate")
 async def generate_medium(request: Request, body: PromptRequest):
     api_key = request.headers.get("x-api-key")
     if api_key != API_KEY:
