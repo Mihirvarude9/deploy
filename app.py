@@ -1,125 +1,101 @@
-# app_async.py  ───────────────────────────────────────────────────────────
-import os, uuid, threading, concurrent.futures, traceback
-
-from fastapi import FastAPI, Request, HTTPException
+from __future__ import annotations
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from diffusers import StableDiffusion3Pipeline, SD3Transformer2DModel
+from starlette.concurrency import run_in_threadpool
+from uuid import uuid4
+import asyncio
 import torch
-from diffusers import SD3Transformer2DModel, StableDiffusion3Pipeline
+import os
+from pathlib import Path
 
-# ─────────────── CONFIG ─────────────────────────────────────────────────
-API_KEY   = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"
-MODEL_ID  = "stabilityai/stable-diffusion-3.5-medium"
-OUTPUT_DIR = "generated"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ───────────────────── CONFIG ─────────────────────
+MODEL_ID = "stabilityai/stable-diffusion-3.5-medium"
+API_KEY = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"
+OUTPUT_DIR = Path("generated")
+OUTPUT_DIR.mkdir(exist_ok=True)
+MAX_PARALLEL = 3
+NUM_STEPS = 50
+GUIDANCE = 5.5
 
-MAX_WORKERS = 4          # <- tweak to match your GPU(s) / CPU cores
-GUIDANCE    = 5.5
-STEPS       = 50
-
-# ─────────────── LOAD MODEL once at start-up ────────────────────────────
-print("🔄 Loading SD-3.5-medium …")
-transformer = SD3Transformer2DModel.from_pretrained(
-    MODEL_ID, subfolder="transformer", torch_dtype=torch.float16
-).to("cuda")
-
-pipe = StableDiffusion3Pipeline.from_pretrained(
-    MODEL_ID, transformer=transformer, torch_dtype=torch.float16
-).to("cuda")
-pipe.set_progress_bar_config(disable=True)
-print("✅ Model ready")
-
-# ─────────────── FASTAPI BOILERPLATE ────────────────────────────────────
+# ────────────── FASTAPI SETUP ──────────────
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.wildmindai.com", "http://localhost:3000"],
+    allow_origins=["https://www.wildmindai.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/images", StaticFiles(directory=OUTPUT_DIR), name="images")
 
-# ─────────────── IN-MEMORY JOB REGISTRY ────────────────────────────────
-JOBS = {}                # job_id → dict(status, filename or error)
-LOCK = threading.Lock()  # protect JOBS
+app.mount("/images", StaticFiles(directory=str(OUTPUT_DIR)), name="images")
 
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
+# ────────────── MODEL LOAD ──────────────
+print("🔄 Loading Stable Diffusion 3.5 Medium...")
+transformer = SD3Transformer2DModel.from_pretrained(
+    MODEL_ID,
+    subfolder="transformer",
+    torch_dtype=torch.float16
+).to("cuda")
 
-def _render(job_id: str, prompt: str) -> None:
-    """Runs in a worker thread."""
-    try:
-        with LOCK:
-            JOBS[job_id]["status"] = "processing"
+pipe = StableDiffusion3Pipeline.from_pretrained(
+    MODEL_ID,
+    transformer=transformer,
+    torch_dtype=torch.float16
+).to("cuda")
 
-        img = pipe(prompt, num_inference_steps=STEPS,
-                   guidance_scale=GUIDANCE).images[0]
+pipe.enable_model_cpu_offload()
+print("✅ Model loaded and ready.")
 
-        filename = f"{job_id}.png"
-        img.save(os.path.join(OUTPUT_DIR, filename))
+# ────────────── CONCURRENCY SETUP ──────────────
+semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
-        with LOCK:
-            JOBS[job_id].update(status="done", filename=filename)
-
-    except Exception as e:              # log & surface error
-        traceback.print_exc()
-        with LOCK:
-            JOBS[job_id].update(status="error", error=str(e))
-
-# ─────────────── REQUEST SCHEMA ────────────────────────────────────────
+# ────────────── SCHEMAS ──────────────
 class PromptRequest(BaseModel):
     prompt: str
 
-def _check_key(req: Request):
-    if req.headers.get("x-api-key") != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+# ────────────── HELPER FUNCTIONS ──────────────
+def run_generation(prompt: str) -> str:
+    image = pipe(
+        prompt=prompt,
+        num_inference_steps=NUM_STEPS,
+        guidance_scale=GUIDANCE
+    ).images[0]
+    
+    filename = f"{uuid4().hex}.png"
+    filepath = OUTPUT_DIR / filename
+    image.save(filepath)
+    return filename
 
-# ─────────────── ROUTES ────────────────────────────────────────────────
-@app.post("/generate")
-async def generate(req: Request, body: PromptRequest):
-    _check_key(req)
+async def generate_image(prompt: str) -> str:
+    async with semaphore:
+        filename = await run_in_threadpool(run_generation, prompt)
+        return filename
+
+# ────────────── ROUTES ──────────────
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
+
+@app.post("/generate/", response_model=dict)
+async def generate(request: Request, body: PromptRequest):
+    api_key = request.headers.get("x-api-key")
+    if api_key != API_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
     prompt = body.prompt.strip()
     if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt is empty")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Prompt is empty")
 
-    job_id = uuid.uuid4().hex
-    with LOCK:
-        JOBS[job_id] = {"status": "queued"}
+    try:
+        filename = await generate_image(prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
-    executor.submit(_render, job_id, prompt)
-
-    return {"job_id": job_id,
-            "status_url": f"/result/{job_id}"}
-
-@app.get("/result/{job_id}")
-async def job_status(job_id: str):
-    with LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Unknown job_id")
-
-        if job["status"] == "done":
-            return {"status": "done",
-                    "image_url": f"https://api.wildmindai.com/images/{job['filename']}"}
-        elif job["status"] == "error":
-            return {"status": "error", "detail": job["error"]}
-        else:
-            return {"status": job["status"]}
-
-# ───────────────── OPTIONAL compatibility endpoint ─────────────────────
-@app.post("/generate_sync")
-async def generate_sync(req: Request, body: PromptRequest):
-    """Blocks; behaves like your original endpoint."""
-    _check_key(req)
-    prompt = body.prompt.strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt is empty")
-
-    img = pipe(prompt, num_inference_steps=STEPS,
-               guidance_scale=GUIDANCE).images[0]
-    filename = f"{uuid.uuid4().hex}.png"
-    img.save(os.path.join(OUTPUT_DIR, filename))
-
-    return {"image_url": f"https://api.wildmindai.com/images/{filename}"}
+    return JSONResponse(
+        {"image_url": f"https://api.wildmindai.com/images/{filename}"}
+    )
