@@ -62,13 +62,15 @@ class PromptIn(BaseModel):
     prompt: str
     steps:  int  = 50
     scale:  float = 5.5
+    width:  int = 768
+    height: int = 768
 
 # ─────────────────── Helper: render on one GPU ─────────────────
-def _render_on(gpu: int, prompt: str, steps: int, scale: float, fname: str):
+def _render_on(gpu: int, prompt: str, steps: int, scale: float, fname: str, width: int, height: int):
     torch.cuda.set_device(gpu)
     pipe = pipes[gpu]
     img  = pipe(prompt, num_inference_steps=steps,
-                guidance_scale=scale).images[0]
+                guidance_scale=scale, width=width, height=height).images[0]
     img.save(fname)
 
 # ───────────────────────── main endpoint ───────────────────────
@@ -90,7 +92,7 @@ async def generate(req: Request, body: PromptIn):
 
     # off-load to thread so event-loop is free
     await run_in_threadpool(
-        partial(_render_on, gpu, prompt, body.steps, body.scale, fname)
+        partial(_render_on, gpu, prompt, body.steps, body.scale, fname, body.width, body.height)
     )
 
     return {"image_url": f"https://api.wildmindai.com/images/{os.path.basename(fname)}"}

@@ -1,64 +1,100 @@
-from fastapi import FastAPI, Request, HTTPException
+#!/usr/bin/env python3
+"""
+Multi-GPU Stable-Diffusion-3.5 backend
+  • One pipeline per GPU (0-7) is kept resident in VRAM.
+  • Every incoming request is routed to the next GPU in round-robin order.
+  • Generation itself is executed in a thread-pool so FastAPI stays non-blocking.
+Run with:
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+    python3 -m uvicorn sd_multigpu:app --host 0.0.0.0 --port 7900 --workers 1
+(keep workers = 1; we already use the eight GPUs internally)
+"""
+
+import os, itertools, asyncio
+from functools import partial
+from uuid import uuid4
+
+import torch
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from uuid import uuid4
+from starlette.concurrency import run_in_threadpool
 from diffusers import SD3Transformer2DModel, StableDiffusion3Pipeline
-import torch
-import os
 
-# === CONFIG ===
-model_id = "stabilityai/stable-diffusion-3.5-medium"
-API_KEY = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"
-OUTPUT_DIR = "generated"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ─────────────────────────── Config ────────────────────────────
+MODEL_ID   = "stabilityai/stable-diffusion-3.5-medium"
+API_KEY    = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"
+GPU_IDS    = [0, 1, 2, 3, 4, 5, 6, 7]                # 8× H200
+OUT_DIR    = os.path.join(os.path.dirname(__file__), "generated")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# === LOAD MODEL (GPU OPTIMIZED) ===
-model = SD3Transformer2DModel.from_pretrained(
-    model_id,
-    subfolder="transformer",
-    torch_dtype=torch.float16
-).to("cuda")
+# ─────────────────── Load one pipeline per GPU ─────────────────
+print("🔄  Loading SD-3.5-medium onto all GPUs …")
+pipes = {}
+for g in GPU_IDS:
+    print(f"  • cuda:{g}  (loading…)")
+    torch.cuda.set_device(g)
+    trans = SD3Transformer2DModel.from_pretrained(
+        MODEL_ID, subfolder="transformer", torch_dtype=torch.float16
+    ).to(f"cuda:{g}")
 
-pipeline = StableDiffusion3Pipeline.from_pretrained(
-    model_id,
-    transformer=model,
-    torch_dtype=torch.float16
-).to("cuda")
+    pipe  = StableDiffusion3Pipeline.from_pretrained(
+        MODEL_ID, transformer=trans, torch_dtype=torch.float16
+    ).to(f"cuda:{g}")
+    pipes[g] = pipe
+print("✅  All pipelines ready!")
 
-# === FASTAPI SETUP ===
-app = FastAPI()
+gpu_cycle = itertools.cycle(GPU_IDS)      # round-robin iterator
 
-# Allow frontend CORS
+# ───────────────────────── FastAPI app ─────────────────────────
+app = FastAPI(title="SD-3.5 multi-GPU")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.wildmindai.com"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["https://www.wildmindai.com", "https://api.wildmindai.com"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# Serve static images
-app.mount("/images", StaticFiles(directory=OUTPUT_DIR), name="images")
+app.mount("/images", StaticFiles(directory=OUT_DIR), name="images")
 
-# === Request Schema ===
-class PromptRequest(BaseModel):
+class PromptIn(BaseModel):
     prompt: str
+    steps:  int  = 50
+    scale:  float = 5.5
 
-# === /generate endpoint ===
+# ─────────────────── Helper: render on one GPU ─────────────────
+def _render_on(gpu: int, prompt: str, steps: int, scale: float, fname: str):
+    torch.cuda.set_device(gpu)
+    pipe = pipes[gpu]
+    img  = pipe(prompt, num_inference_steps=steps,
+                guidance_scale=scale).images[0]
+    img.save(fname)
+
+# ───────────────────────── main endpoint ───────────────────────
 @app.post("/generate")
-async def generate(request: Request, body: PromptRequest):
-    api_key = request.headers.get("x-api-key")
-    if api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+async def generate(req: Request, body: PromptIn):
+    # auth
+    if req.headers.get("x-api-key") != API_KEY:
+        raise HTTPException(401, "bad api key")
 
     prompt = body.prompt.strip()
     if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt is empty")
+        raise HTTPException(400, "empty prompt")
 
-    image = pipeline(prompt=prompt, num_inference_steps=50, guidance_scale=5.5).images[0]
-    filename = f"{uuid4().hex}.png"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    image.save(filepath)
+    # choose GPU
+    gpu = next(gpu_cycle)
 
-    return {"image_url": f"https://api.wildmindai.com/images/{filename}"}
+    # output file
+    fname = os.path.join(OUT_DIR, f"{uuid4().hex}.png")
+
+    # off-load to thread so event-loop is free
+    await run_in_threadpool(
+        partial(_render_on, gpu, prompt, body.steps, body.scale, fname)
+    )
+
+    return {"image_url": f"https://api.wildmindai.com/images/{os.path.basename(fname)}"}
+
+# ───────────────────────── health-check ────────────────────────
+@app.get("/ping")
+def ping(): return {"status": "ok"}
