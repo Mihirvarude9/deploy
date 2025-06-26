@@ -1,151 +1,100 @@
-# sd_multigpu.py  ───────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
+"""
+Multi-GPU Stable-Diffusion-3.5 backend
+  • One pipeline per GPU (0-7) is kept resident in VRAM.
+  • Every incoming request is routed to the next GPU in round-robin order.
+  • Generation itself is executed in a thread-pool so FastAPI stays non-blocking.
+Run with:
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+    python3 -m uvicorn sd_multigpu:app --host 0.0.0.0 --port 7900 --workers 1
+(keep workers = 1; we already use the eight GPUs internally)
+"""
+
 import os, itertools, asyncio
-from functools    import partial
-from uuid         import uuid4
-from typing       import Dict
+from functools import partial
+from uuid import uuid4
 
 import torch
-from fastapi             import FastAPI, Request, HTTPException
-from pydantic            import BaseModel
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses   import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
-from diffusers           import (
-    StableDiffusion3Pipeline,
-    SD3Transformer2DModel,
-    FlowMatchEulerDiscreteScheduler,
-)
+from diffusers import SD3Transformer2DModel, StableDiffusion3Pipeline
 
+# ─────────────────────────── Config ────────────────────────────
 MODEL_ID   = "stabilityai/stable-diffusion-3.5-medium"
 API_KEY    = "wildmind_5879fcd4a8b94743b3a7c8c1a1b4"
+GPU_IDS    = [0, 1, 2, 3, 4, 5, 6, 7]                # 8× H200
 OUT_DIR    = os.path.join(os.path.dirname(__file__), "generated")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-################################################################################
-# 1.  GPU-level bookkeeping
-################################################################################
-GPU_IDS          = list(range(torch.cuda.device_count()))
-gpu_active_jobs  = {gid: 0 for gid in GPU_IDS}         # how many requests run
-gpu_lock         = asyncio.Lock()                      # guards gpu_active_jobs
+# ─────────────────── Load one pipeline per GPU ─────────────────
+print("🔄  Loading SD-3.5-medium onto all GPUs …")
+pipes = {}
+for g in GPU_IDS:
+    print(f"  • cuda:{g}  (loading…)")
+    torch.cuda.set_device(g)
+    trans = SD3Transformer2DModel.from_pretrained(
+        MODEL_ID, subfolder="transformer", torch_dtype=torch.float16
+    ).to(f"cuda:{g}")
 
+    pipe  = StableDiffusion3Pipeline.from_pretrained(
+        MODEL_ID, transformer=trans, torch_dtype=torch.float16
+    ).to(f"cuda:{g}")
+    pipes[g] = pipe
+print("✅  All pipelines ready!")
 
-def _choose_gpu_round_robin() -> int:
-    """
-    Return the GPU id that currently has *least* active work.
-    Called inside gpu_lock → thread-safe.
-    """
-    return min(gpu_active_jobs, key=gpu_active_jobs.get)
+gpu_cycle = itertools.cycle(GPU_IDS)      # round-robin iterator
 
+# ───────────────────────── FastAPI app ─────────────────────────
+app = FastAPI(title="SD-3.5 multi-GPU")
 
-async def acquire_gpu() -> int:
-    """
-    Atomically pick a GPU and mark one job active.
-    """
-    async with gpu_lock:
-        gid = _choose_gpu_round_robin()
-        gpu_active_jobs[gid] += 1
-        return gid
-
-
-def release_gpu(gid: int) -> None:
-    """Decrement active-job counter (runs in thread, no async needed)."""
-    gpu_active_jobs[gid] -= 1
-
-
-################################################################################
-# 2.  One pipeline object *per GPU*  (lazy-loaded on first use)
-################################################################################
-PIPELINES: Dict[int, StableDiffusion3Pipeline] = {}
-PIPELINE_LOCK = asyncio.Lock()   # ensures we create a pipeline only once
-
-
-def _get_pipeline(gid: int) -> StableDiffusion3Pipeline:
-    """
-    Create & cache a pipeline *on that GPU* the first time it is requested.
-    Subsequent calls return the cached instance.
-    """
-    if gid in PIPELINES:
-        return PIPELINES[gid]
-
-    with torch.cuda.device(gid):
-        print(f"🔄  Loading SD-3.5-medium on GPU {gid} …")
-        transformer = SD3Transformer2DModel.from_pretrained(
-            MODEL_ID, subfolder="transformer", torch_dtype=torch.float16
-        ).to(f"cuda:{gid}")
-
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            MODEL_ID, transformer=transformer, torch_dtype=torch.float16
-        ).to(f"cuda:{gid}")
-
-        pipe.enable_model_cpu_offload()   # VRAM saver
-        PIPELINES[gid] = pipe
-        print(f"✅  GPU {gid} ready!")
-        return pipe
-
-
-################################################################################
-# 3.  One request  →  one scheduler copy  →  render in thread
-################################################################################
-def _render(gid: int, prompt: str) -> str:
-    pipe = _get_pipeline(gid)
-
-    # give this call its own scheduler
-    pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipe.scheduler.config
-    )
-    pipe.scheduler.set_timesteps(50, device=pipe.device)
-
-    img = pipe(prompt, num_inference_steps=50,
-               guidance_scale=5.5).images[0]
-
-    fname = f"{uuid4().hex}.png"
-    img.save(os.path.join(OUT_DIR, fname))
-    return fname
-
-
-async def generate_image(prompt: str) -> str:
-    gid = await acquire_gpu()             # ↙ async – no blocking here
-    try:
-        filename = await run_in_threadpool(partial(_render, gid, prompt))
-        return filename
-    finally:
-        release_gpu(gid)
-
-
-################################################################################
-# 4.  FastAPI glue
-################################################################################
-class Prompt(BaseModel):
-    prompt: str
-
-
-app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.wildmindai.com"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["https://www.wildmindai.com", "https://api.wildmindai.com"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
+
 app.mount("/images", StaticFiles(directory=OUT_DIR), name="images")
 
+class PromptIn(BaseModel):
+    prompt: str
+    steps:  int  = 50
+    scale:  float = 5.5
 
+# ─────────────────── Helper: render on one GPU ─────────────────
+def _render_on(gpu: int, prompt: str, steps: int, scale: float, fname: str):
+    torch.cuda.set_device(gpu)
+    pipe = pipes[gpu]
+    img  = pipe(prompt, num_inference_steps=steps,
+                guidance_scale=scale).images[0]
+    img.save(fname)
+
+# ───────────────────────── main endpoint ───────────────────────
 @app.post("/generate")
-async def generate(req: Request, body: Prompt):
+async def generate(req: Request, body: PromptIn):
+    # auth
     if req.headers.get("x-api-key") != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(401, "bad api key")
 
     prompt = body.prompt.strip()
     if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt is empty")
+        raise HTTPException(400, "empty prompt")
 
-    filename = await generate_image(prompt)
-    return JSONResponse(
-        {"image_url": f"https://api.wildmindai.com/images/{filename}"}
+    # choose GPU
+    gpu = next(gpu_cycle)
+
+    # output file
+    fname = os.path.join(OUT_DIR, f"{uuid4().hex}.png")
+
+    # off-load to thread so event-loop is free
+    await run_in_threadpool(
+        partial(_render_on, gpu, prompt, body.steps, body.scale, fname)
     )
 
+    return {"image_url": f"https://api.wildmindai.com/images/{os.path.basename(fname)}"}
 
-@app.get("/healthz")        # simple liveness probe
-def health():
-    return {"status": "ok", "gpu_jobs": gpu_active_jobs}
+# ───────────────────────── health-check ────────────────────────
+@app.get("/ping")
+def ping(): return {"status": "ok"}
